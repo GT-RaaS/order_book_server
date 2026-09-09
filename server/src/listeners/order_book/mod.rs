@@ -1,6 +1,9 @@
 use crate::{
     HL_NODE,
-    listeners::{directory::DirectoryListener, order_book::state::OrderBookState},
+    listeners::{
+        directory::{DirectoryListener, seek_to_last_line_boundary},
+        order_book::state::OrderBookState,
+    },
     order_book::{
         Coin, Snapshot,
         multi_book::{Snapshots, load_snapshots_from_json},
@@ -19,7 +22,7 @@ use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet, VecDeque},
-    io::{Read, Seek, SeekFrom},
+    io::Seek,
     path::PathBuf,
     sync::Arc,
     time::Duration,
@@ -350,15 +353,14 @@ impl OrderBookListener {
         // Check for `Modify` event (only if the file is already initialized)
         else {
             // If we are not tracking anything right now, we treat a file update as declaring that it has been created.
-            // Unfortunately, we miss the update that occurs at this time step.
-            // We go to the end of the file to read for updates after that.
+            // Skip complete history, but keep any trailing line that is still being written.
             if self.is_reading(event_source) {
                 self.on_file_modification(event_source)?;
             } else {
                 info!("-- Event: {} modified, tracking it now --", new_path.display());
                 let file = self.file_mut(event_source);
                 let mut new_file = File::open(new_path)?;
-                new_file.seek(SeekFrom::End(0))?;
+                seek_to_last_line_boundary(&mut new_file)?;
                 *file = Some(new_file);
             }
         }
@@ -384,19 +386,19 @@ impl DirectoryListener for OrderBookListener {
     }
 
     fn on_file_creation(&mut self, new_file: PathBuf, event_source: EventSource) -> Result<()> {
+        if self.is_reading(event_source) {
+            self.on_file_modification(event_source)?;
+        }
         if let Some(file) = self.file_mut(event_source).as_mut() {
-            let mut buf = String::new();
-            file.read_to_string(&mut buf)?;
-            if !buf.is_empty() {
-                self.process_data(buf, event_source)?;
+            if file.stream_position()? < file.metadata()?.len() {
+                return Err(format!("Incomplete {event_source} line when rotating to {}", new_file.display()).into());
             }
         }
         *self.file_mut(event_source) = Some(File::open(new_file)?);
-        Ok(())
+        self.on_file_modification(event_source)
     }
 
     fn process_data(&mut self, data: String, event_source: EventSource) -> Result<()> {
-        let total_len = data.len();
         let lines = data.lines();
         for line in lines {
             if line.is_empty() {
@@ -412,21 +414,15 @@ impl DirectoryListener for OrderBookListener {
                 EventSource::OrderDiffs => serde_json::from_str(line)
                     .map(|batch: Batch<NodeDataOrderDiff>| (batch.block_number(), EventBatch::BookDiffs(batch))),
             };
-            let (height, event_batch) = match res {
-                Ok(data) => data,
-                Err(err) => {
-                    // if we run into a serialization error (hitting EOF), just return to last line.
-                    error!(
-                        "{event_source} serialization error {err}, height: {:?}, line: {:?}",
-                        self.order_book_state.as_ref().map(OrderBookState::height),
-                        &line[..100],
-                    );
-                    #[allow(clippy::unwrap_used)]
-                    let total_len: i64 = total_len.try_into().unwrap();
-                    self.file_mut(event_source).as_mut().map(|f| f.seek_relative(-total_len));
-                    break;
-                }
-            };
+            // Only newline-terminated records reach this parser. An invalid complete record is
+            // corruption, not a partial write; stop instead of repeatedly replaying earlier rows.
+            let (height, event_batch) = res.map_err(|err| {
+                format!(
+                    "{event_source} deserialization error {err}, height: {:?}, line: {:?}",
+                    self.order_book_state.as_ref().map(OrderBookState::height),
+                    line.chars().take(100).collect::<String>(),
+                )
+            })?;
             if height % 100 == 0 {
                 info!("{event_source} block: {height}");
             }
@@ -474,4 +470,88 @@ pub(crate) enum InternalMessage {
 pub(crate) struct L2SnapshotParams {
     n_sig_figs: Option<u32>,
     mantissa: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs::OpenOptions, io::Write};
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("order-book-lines-{}", rand::random::<u64>()));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _unused = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn empty_batch(height: u64) -> String {
+        format!(
+            "{{\"local_time\":\"2026-09-09T01:26:47\",\"block_time\":\"2026-09-09T01:26:46\",\"block_number\":{height},\"events\":[]}}\n"
+        )
+    }
+
+    #[test]
+    fn append_and_rotation_preserve_order_batches() {
+        let directory = TestDirectory::new();
+        let mut listener = OrderBookListener::new(None, true);
+        let first = empty_batch(100);
+        let second = empty_batch(101);
+        let third = empty_batch(102);
+
+        for source in [EventSource::OrderStatuses, EventSource::OrderDiffs] {
+            let path = directory.0.join(format!("{source}-1"));
+            fs::write(&path, format!("{first}{}", &second[..30])).unwrap();
+            listener.on_file_creation(path.clone(), source).unwrap();
+            assert_eq!(listener.file_mut(source).as_mut().unwrap().stream_position().unwrap(), first.len() as u64);
+
+            // Repeated notifications before the writer finishes must not consume the partial row.
+            listener.on_file_modification(source).unwrap();
+            let mut writer = OpenOptions::new().append(true).open(&path).unwrap();
+            writer.write_all(second[30..].as_bytes()).unwrap();
+            listener.on_file_modification(source).unwrap();
+
+            let next_path = directory.0.join(format!("{source}-2"));
+            fs::write(&next_path, &third).unwrap();
+            listener.on_file_creation(next_path, source).unwrap();
+        }
+
+        for expected_height in 100..=102 {
+            let (statuses, diffs) = listener.pop_cache().unwrap();
+            assert_eq!(statuses.block_number(), expected_height);
+            assert_eq!(diffs.block_number(), expected_height);
+        }
+        assert!(listener.pop_cache().is_none());
+    }
+
+    #[test]
+    fn rotation_rejects_unfinished_record() {
+        let directory = TestDirectory::new();
+        let mut listener = OrderBookListener::new(None, true);
+        let path = directory.0.join("old");
+        fs::write(&path, "{\"block_number\":").unwrap();
+        listener.on_file_creation(path, EventSource::OrderStatuses).unwrap();
+
+        let next_path = directory.0.join("new");
+        fs::write(&next_path, empty_batch(102)).unwrap();
+        let err = listener.on_file_creation(next_path, EventSource::OrderStatuses).unwrap_err();
+        assert!(err.to_string().contains("Incomplete OrderStatuses line"));
+    }
+
+    #[test]
+    fn malformed_complete_records_return_errors_without_panicking() {
+        let mut listener = OrderBookListener::new(None, true);
+        for data in ["{\n".to_string(), format!("{}中\n", "x".repeat(99))] {
+            let err = listener.process_data(data, EventSource::OrderStatuses).unwrap_err();
+            assert!(err.to_string().contains("deserialization error"));
+        }
+    }
 }

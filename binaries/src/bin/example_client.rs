@@ -2,7 +2,10 @@
 use clap::{Parser, ValueEnum};
 use futures_util::{SinkExt, StreamExt};
 use server::Result;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    connect_async_with_config,
+    tungstenite::{Message, protocol::WebSocketConfig},
+};
 
 #[derive(Debug, Clone, ValueEnum)]
 enum Subscription {
@@ -34,7 +37,10 @@ async fn main() -> Result<()> {
     let url = format!("ws://{}:{}/ws", args.address, args.port);
     println!("Connecting to {url}");
 
-    let (ws_stream, _) = connect_async(url).await?;
+    // Full L4 snapshots can exceed the default 16 MiB frame limit.
+    let config =
+        WebSocketConfig::default().max_frame_size(Some(64 * 1024 * 1024)).max_message_size(Some(64 * 1024 * 1024));
+    let (ws_stream, _) = connect_async_with_config(url, Some(config), false).await?;
     println!("Connected!");
 
     let (mut write, mut read) = ws_stream.split();

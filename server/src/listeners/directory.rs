@@ -1,6 +1,6 @@
 use crate::{prelude::*, types::node_data::EventSource};
 use fs::File;
-use io::Read;
+use io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
 // We want all of these functions to be synchronous just for ease of use since they are fast (for now)
@@ -16,11 +16,90 @@ pub(crate) trait DirectoryListener {
     fn process_data(&mut self, data: String, event_source: EventSource) -> Result<()>;
 
     fn on_file_modification(&mut self, event_source: EventSource) -> Result<()> {
-        let mut buf = String::new();
         let file = self.file_mut(event_source).as_mut().ok_or("No file being tracked")?;
-        file.read_to_string(&mut buf)?;
-        self.process_data(buf, event_source)?;
+        let data = read_complete_lines(file)?;
+        if !data.is_empty() {
+            self.process_data(data, event_source)?;
+        }
         Ok(())
+    }
+}
+
+// A file notification can arrive before the writer finishes a JSON line, including in the middle
+// of a UTF-8 character. Keep the unfinished bytes on disk for the next read.
+fn read_complete_lines<R: Read + Seek>(reader: &mut R) -> Result<String> {
+    let mut data = Vec::new();
+    reader.read_to_end(&mut data)?;
+    let complete_len = data.iter().rposition(|&byte| byte == b'\n').map_or(0, |index| index + 1);
+    let pending_len = i64::try_from(data.len() - complete_len)?;
+    reader.seek(SeekFrom::Current(-pending_len))?;
+    data.truncate(complete_len);
+    Ok(String::from_utf8(data)?)
+}
+
+// Skip complete history when attaching to an existing file, but retain a line still being written.
+pub(super) fn seek_to_last_line_boundary<R: Read + Seek>(reader: &mut R) -> Result<()> {
+    let mut end = reader.seek(SeekFrom::End(0))?;
+    let mut buffer = [0; 4096];
+    while end > 0 {
+        let start = end.saturating_sub(buffer.len() as u64);
+        let len = usize::try_from(end - start)?;
+        reader.seek(SeekFrom::Start(start))?;
+        reader.read_exact(&mut buffer[..len])?;
+        if let Some(index) = buffer[..len].iter().rposition(|&byte| byte == b'\n') {
+            reader.seek(SeekFrom::Start(start + index as u64 + 1))?;
+            return Ok(());
+        }
+        end = start;
+    }
+    reader.seek(SeekFrom::Start(0))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod line_tests {
+    use super::{read_complete_lines, seek_to_last_line_boundary};
+    use std::io::Cursor;
+
+    #[test]
+    fn partial_line_is_retried_without_replaying_complete_lines() {
+        let first = "{\"block_number\":100,\"events\":[]}\n";
+        let second = "{\"block_number\":101,\"events\":[]}\n";
+        let mut reader = Cursor::new([first.as_bytes(), &second.as_bytes()[..12]].concat());
+
+        assert_eq!(read_complete_lines(&mut reader).unwrap(), first);
+        assert_eq!(reader.position(), first.len() as u64);
+        assert_eq!(read_complete_lines(&mut reader).unwrap(), "");
+
+        reader.get_mut().extend_from_slice(&second.as_bytes()[12..]);
+        assert_eq!(read_complete_lines(&mut reader).unwrap(), second);
+        assert_eq!(read_complete_lines(&mut reader).unwrap(), "");
+    }
+
+    #[test]
+    fn split_utf8_and_json_wait_for_newline() {
+        let line = "{\"value\":\"中文\"}\n";
+        let mut reader = Cursor::new(Vec::new());
+        for (index, &byte) in line.as_bytes().iter().enumerate() {
+            reader.get_mut().push(byte);
+            let expected = if index + 1 == line.len() { line } else { "" };
+            assert_eq!(read_complete_lines(&mut reader).unwrap(), expected);
+        }
+        assert_eq!(read_complete_lines(&mut reader).unwrap(), "");
+    }
+
+    #[test]
+    fn attaching_to_file_preserves_unfinished_line() {
+        for (data, expected) in [
+            (String::new(), 0),
+            ("complete\n".to_string(), 9),
+            (format!("complete\n{}", "x".repeat(9000)), 9),
+            ("unfinished".to_string(), 0),
+        ] {
+            let mut reader = Cursor::new(data.into_bytes());
+            seek_to_last_line_boundary(&mut reader).unwrap();
+            assert_eq!(reader.position(), expected);
+        }
     }
 }
 
