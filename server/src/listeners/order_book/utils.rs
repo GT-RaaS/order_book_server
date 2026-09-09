@@ -1,7 +1,7 @@
 use crate::{
     listeners::order_book::{L2SnapshotParams, L2Snapshots},
     order_book::{
-        Snapshot,
+        Oid, Side, Snapshot,
         multi_book::{OrderBooks, Snapshots},
         types::InnerOrder,
     },
@@ -44,13 +44,17 @@ pub(super) async fn process_rmp_file(dir: &Path) -> Result<PathBuf> {
     Ok(output_path)
 }
 
-pub(super) fn validate_snapshot_consistency<O: Clone + PartialEq + Debug>(
+pub(super) fn validate_snapshot_consistency<O: InnerOrder + PartialEq + Debug>(
     snapshot: &Snapshots<O>,
-    expected: Snapshots<O>,
+    expected: &Snapshots<O>,
     ignore_spot: bool,
 ) -> Result<()> {
-    let mut snapshot_map: HashMap<_, _> =
-        expected.value().into_iter().filter(|(c, _)| !c.is_spot() || !ignore_spot).collect();
+    let mut snapshot_map: HashMap<_, _> = expected
+        .as_ref()
+        .iter()
+        .filter(|(c, _)| !c.is_spot() || !ignore_spot)
+        .map(|(coin, book)| (coin.clone(), book))
+        .collect();
 
     for (coin, book) in snapshot.as_ref() {
         if ignore_spot && coin.is_spot() {
@@ -58,12 +62,24 @@ pub(super) fn validate_snapshot_consistency<O: Clone + PartialEq + Debug>(
         }
         let book1 = book.as_ref();
         if let Some(book2) = snapshot_map.remove(coin) {
-            for (orders1, orders2) in book1.as_ref().iter().zip(book2.as_ref()) {
-                for (order1, order2) in orders1.iter().zip(orders2.iter()) {
-                    if *order1 != *order2 {
-                        return Err(
-                            format!("Orders do not match, expected: {:?} received: {:?}", *order2, *order1).into()
-                        );
+            for (side, (orders1, orders2)) in [Side::Bid, Side::Ask].into_iter().zip(book1.iter().zip(book2.as_ref())) {
+                // zip alone would miss a trailing order present on only one side.
+                for index in 0..orders1.len().max(orders2.len()) {
+                    let received = orders1.get(index);
+                    let expected = orders2.get(index);
+                    if received != expected {
+                        let expected_oid_in_received_book = expected.and_then(|order| find_order(book, order.oid()));
+                        let received_oid_in_expected_book = received.and_then(|order| find_order(book2, order.oid()));
+                        return Err(format!(
+                            "Orders do not match, coin: {}, side: {side:?}, index: {index}, \
+                             expected_count: {}, received_count: {}, expected: {expected:?}, received: {received:?}, \
+                             expected_oid_in_received_book: {expected_oid_in_received_book:?}, \
+                             received_oid_in_expected_book: {received_oid_in_expected_book:?}",
+                            coin.value(),
+                            orders2.len(),
+                            orders1.len(),
+                        )
+                        .into());
                     }
                 }
             }
@@ -75,6 +91,16 @@ pub(super) fn validate_snapshot_consistency<O: Clone + PartialEq + Debug>(
         return Err("Extra orderbooks detected".to_string().into());
     }
     Ok(())
+}
+
+// Only scan by order ID after a mismatch; keep successful validation linear.
+fn find_order<O: InnerOrder>(book: &Snapshot<O>, oid: Oid) -> Option<(Side, usize, &O)> {
+    for (side, orders) in [Side::Bid, Side::Ask].into_iter().zip(book.as_ref()) {
+        if let Some((index, order)) = orders.iter().enumerate().find(|(_, order)| order.oid() == oid) {
+            return Some((side, index, order));
+        }
+    }
+    None
 }
 
 impl L2SnapshotParams {
@@ -151,5 +177,100 @@ impl<T> BatchQueue<T> {
 
     pub(super) fn front(&self) -> Option<&Batch<T>> {
         self.deque.front()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        order_book::{Coin, OrderBook, Px, Sz},
+        types::inner::InnerL4Order,
+    };
+    use alloy::primitives::Address;
+
+    fn order(oid: u64, side: Side) -> InnerL4Order {
+        InnerL4Order {
+            user: Address::ZERO,
+            coin: Coin::new("ETH"),
+            side,
+            limit_px: Px::new(100),
+            sz: Sz::new(1),
+            oid,
+            timestamp: 100,
+            trigger_condition: "N/A".into(),
+            is_trigger: false,
+            trigger_px: "0.0".into(),
+            is_position_tpsl: false,
+            reduce_only: false,
+            order_type: "Limit".into(),
+            tif: Some("Gtc".into()),
+            cloid: None,
+        }
+    }
+
+    fn snapshot(orders: Vec<InnerL4Order>) -> Snapshots<InnerL4Order> {
+        let mut book = OrderBook::new();
+        for order in orders {
+            book.add_order(order);
+        }
+        Snapshots::new(HashMap::from([(Coin::new("ETH"), book.to_snapshot())]))
+    }
+
+    #[test]
+    fn matching_snapshots_pass() {
+        let orders = vec![order(1, Side::Bid), order(2, Side::Bid)];
+        assert!(validate_snapshot_consistency(&snapshot(orders.clone()), &snapshot(orders), false).is_ok());
+    }
+
+    #[test]
+    fn trailing_missing_and_extra_orders_fail_on_both_sides() {
+        for side in [Side::Bid, Side::Ask] {
+            for prefix_len in [0, 1] {
+                let orders = vec![order(1, side), order(2, side)];
+                let prefix = orders[..prefix_len].to_vec();
+                let missing =
+                    validate_snapshot_consistency(&snapshot(prefix.clone()), &snapshot(orders.clone()), false)
+                        .unwrap_err()
+                        .to_string();
+                assert!(missing.contains(&format!("side: {side:?}, index: {prefix_len}")), "{missing}");
+                assert!(missing.contains(&format!("expected_count: 2, received_count: {prefix_len}")), "{missing}");
+                assert!(missing.contains("received: None"), "{missing}");
+                let extra =
+                    validate_snapshot_consistency(&snapshot(orders), &snapshot(prefix), false).unwrap_err().to_string();
+                assert!(extra.contains(&format!("expected_count: {prefix_len}, received_count: 2")), "{extra}");
+                assert!(extra.contains("expected: None"), "{extra}");
+            }
+        }
+    }
+
+    #[test]
+    fn missing_order_diagnostic_looks_up_the_other_order_by_id() {
+        let expected = snapshot(vec![order(1, Side::Bid), order(2, Side::Bid)]);
+        let received = snapshot(vec![order(2, Side::Bid)]);
+        let error = validate_snapshot_consistency(&received, &expected, false).unwrap_err().to_string();
+        assert!(error.contains("expected_oid_in_received_book: None"), "{error}");
+        assert!(error.contains("received_oid_in_expected_book: Some((Bid, 1,"), "{error}");
+    }
+
+    #[test]
+    fn misplaced_order_diagnostic_shows_its_actual_position() {
+        let expected = snapshot(vec![order(1, Side::Bid), order(2, Side::Bid)]);
+        let mut misplaced = order(1, Side::Bid);
+        misplaced.limit_px = Px::new(99);
+        let received = snapshot(vec![misplaced, order(2, Side::Bid)]);
+        let error = validate_snapshot_consistency(&received, &expected, false).unwrap_err().to_string();
+        assert!(error.contains("expected_oid_in_received_book: Some((Bid, 1,"), "{error}");
+        assert!(error.contains("received_oid_in_expected_book: Some((Bid, 1,"), "{error}");
+    }
+
+    #[test]
+    fn metadata_mismatch_still_fails() {
+        let expected = snapshot(vec![order(1, Side::Bid)]);
+        let mut changed = order(1, Side::Bid);
+        changed.timestamp += 1;
+        let error = validate_snapshot_consistency(&snapshot(vec![changed]), &expected, false).unwrap_err().to_string();
+        assert!(error.contains("Orders do not match"), "{error}");
+        assert!(error.contains("expected_oid_in_received_book: Some((Bid, 0,"), "{error}");
     }
 }

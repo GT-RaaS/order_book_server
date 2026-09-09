@@ -12,7 +12,7 @@ This server provides the `l2book` and `trades` endpoints from [Hyperliquid’s o
   `n_levels`, which can be up to `100` and defaults to `20`.
 - This server also introduces a new endpoint: `l4book`.
 
-The `l4book` subscription first sends a snapshot of the entire book and then forwards order diffs by block. The subscription format is:
+The `l4book` subscription first sends a snapshot of the entire book and then forwards order diffs by block. A new full snapshot is also sent after the server rebuilds its order book. Clients must replace their local book whenever they receive an `L4Book::Snapshot`, including clearing it when both sides are empty, and then apply subsequent updates. The subscription format is:
 
 ```json
 {
@@ -35,7 +35,7 @@ cargo run --release --bin websocket_server -- --address 0.0.0.0 --port 8000
 ```
 
 If this local server does not detect the node writing down any new events, it will automatically exit after some amount of time (currently set to 5 seconds).
-In addition, the local server periodically fetches order book snapshots from the node, and compares to its own internal state. If a difference is detected, it will exit.
+In addition, the local server periodically fetches order book snapshots from the node and compares them to its own internal state at the same block height. If a difference is detected, it logs an error, discards the old order book, rebuilds from the node snapshot, and replays cached updates before resuming. Connected L2 and L4 subscribers receive fresh snapshots after recovery. If replay fails or cannot catch up, the old book stays cleared and order book streaming waits for the next snapshot; a consistency mismatch does not terminate the server.
 
 If you want logging, prepend the command with `RUST_LOG=info`.
 

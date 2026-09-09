@@ -122,6 +122,24 @@ async fn handle_socket(
                                     send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots.as_ref(), *time).await;
                                 }
                             },
+                            InternalMessage::BookReset { snapshot, l2_snapshots } => {
+                                universe = new_universe(l2_snapshots, ignore_spot);
+                                for sub in manager.subscriptions() {
+                                    match sub {
+                                        Subscription::L4Book { coin } => {
+                                            let msg = l4_snapshot_response(coin, snapshot);
+                                            send_socket_message(&mut socket, msg).await;
+                                        }
+                                        Subscription::L2Book { coin, .. } if !universe.contains(coin) => {
+                                            let book = L2Book::from_l2_snapshot(coin.clone(), [vec![], vec![]], snapshot.time);
+                                            send_socket_message(&mut socket, ServerResponse::L2Book(book)).await;
+                                        }
+                                        _ => {
+                                            send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots.as_ref(), snapshot.time).await;
+                                        }
+                                    }
+                                }
+                            },
                             InternalMessage::Fills{ batch } => {
                                 let mut trades = coin_to_trades(batch);
                                 for sub in manager.subscriptions() {
@@ -241,6 +259,19 @@ async fn send_socket_message(socket: &mut WebSocket, msg: ServerResponse) {
             error!("Server response serialization error: {err}");
         }
     }
+}
+
+fn l4_snapshot_response(coin: &str, snapshot: &TimedSnapshots) -> ServerResponse {
+    let levels = snapshot.snapshot.as_ref().get(&Coin::new(coin)).map_or_else(
+        || [vec![], vec![]],
+        |book| book.as_ref().clone().map(|orders| orders.into_iter().map(L4Order::from).collect()),
+    );
+    ServerResponse::L4Book(L4Book::Snapshot {
+        coin: coin.to_string(),
+        time: snapshot.time,
+        height: snapshot.height,
+        levels,
+    })
 }
 
 // derive it from l2_snapshots because thats convenient
@@ -369,5 +400,39 @@ impl Subscription {
             return Err("Snapshot Failed".into());
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::order_book::multi_book::{Snapshots, load_snapshots_from_str};
+    use alloy::primitives::Address;
+    use serde_json::json;
+
+    #[test]
+    fn l4_reset_sends_a_full_snapshot_and_clears_removed_coins() {
+        let text = json!([102, [["ETH", [[[
+            Address::ZERO,
+            {
+                "coin": "ETH", "side": "B", "limitPx": "2153.6", "sz": "0.1139",
+                "oid": 2, "timestamp": 1788919049596_u64, "triggerCondition": "N/A",
+                "isTrigger": false, "triggerPx": "0.0", "isPositionTpsl": false,
+                "reduceOnly": false, "orderType": "Limit", "tif": "Gtc", "cloid": null
+            }
+        ]], []]]]])
+        .to_string();
+        let (_, orders) = load_snapshots_from_str::<_, (Address, L4Order)>(&text).unwrap();
+        let snapshot = TimedSnapshots { height: 102, time: 1788919049596, snapshot: orders };
+        let response = serde_json::to_value(l4_snapshot_response("ETH", &snapshot)).unwrap();
+        assert_eq!(response["channel"], "l4Book");
+        assert_eq!(response["data"]["Snapshot"]["height"], 102);
+        assert_eq!(response["data"]["Snapshot"]["time"], snapshot.time);
+        assert_eq!(response["data"]["Snapshot"]["levels"][0][0]["oid"], 2);
+
+        let removed = TimedSnapshots { snapshot: Snapshots::new(HashMap::new()), ..snapshot };
+        let response = serde_json::to_value(l4_snapshot_response("ETH", &removed)).unwrap();
+        assert_eq!(response["data"]["Snapshot"]["coin"], "ETH");
+        assert_eq!(response["data"]["Snapshot"]["levels"], json!([[], []]));
     }
 }

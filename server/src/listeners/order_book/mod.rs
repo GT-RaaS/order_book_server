@@ -73,6 +73,7 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
     watcher.watch(&order_diffs_dir, RecursiveMode::Recursive)?;
     let start = Instant::now() + Duration::from_secs(5);
     let mut ticker = interval_at(start, Duration::from_secs(10));
+    let mut snapshot_fetch_in_progress = false;
     loop {
         tokio::select! {
             event = fs_event_rx.recv() =>  match event {
@@ -110,6 +111,7 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
                 }
             },
             snapshot_fetch_res = snapshot_fetch_task_rx.recv() => {
+                snapshot_fetch_in_progress = false;
                 match snapshot_fetch_res {
                     None => {
                         return Err("Snapshot fetch task sender dropped".into());
@@ -121,9 +123,11 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
                 }
             }
             _ = ticker.tick() => {
-                let listener = listener.clone();
-                let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
-                fetch_snapshot(dir.clone(), listener, snapshot_fetch_task_tx, ignore_spot);
+                // The snapshot output file and replay cache are shared by all fetches.
+                if !snapshot_fetch_in_progress {
+                    snapshot_fetch_in_progress = true;
+                    fetch_snapshot(dir.clone(), listener.clone(), snapshot_fetch_task_tx.clone(), ignore_spot);
+                }
             }
             () = sleep(Duration::from_secs(5)) => {
                 let listener = listener.lock().await;
@@ -141,53 +145,69 @@ fn fetch_snapshot(
     tx: UnboundedSender<Result<()>>,
     ignore_spot: bool,
 ) {
-    let tx = tx.clone();
     tokio::spawn(async move {
-        let res = match process_rmp_file(&dir).await {
-            Ok(output_fln) => {
-                let state = {
-                    let mut listener = listener.lock().await;
-                    listener.begin_caching();
-                    listener.clone_state()
-                };
-                let snapshot = load_snapshots_from_json::<InnerL4Order, (Address, L4Order)>(&output_fln).await;
-                info!("Snapshot fetched");
-                // sleep to let some updates build up.
-                sleep(Duration::from_secs(1)).await;
-                let mut cache = {
-                    let mut listener = listener.lock().await;
-                    listener.take_cache()
-                };
-                info!("Cache has {} elements", cache.len());
-                match snapshot {
-                    Ok((height, expected_snapshot)) => {
-                        if let Some(mut state) = state {
-                            while state.height() < height {
-                                if let Some((order_statuses, order_diffs)) = cache.pop_front() {
-                                    state.apply_updates(order_statuses, order_diffs)?;
-                                } else {
-                                    return Err::<(), Error>("Not enough cached updates".into());
-                                }
-                            }
-                            if state.height() > height {
-                                return Err("Fetched snapshot lagging stored state".into());
-                            }
-                            let stored_snapshot = state.compute_snapshot().snapshot;
-                            info!("Validating snapshot");
-                            validate_snapshot_consistency(&stored_snapshot, expected_snapshot, ignore_spot)
-                        } else {
-                            listener.lock().await.init_from_snapshot(expected_snapshot, height);
-                            Ok(())
-                        }
-                    }
-                    Err(err) => Err(err),
-                }
-            }
-            Err(err) => Err(err),
-        };
+        let res = fetch_and_validate_snapshot(&dir, &listener, ignore_spot).await;
+        // Also stop caching on an early fetch/alignment error.
+        listener.lock().await.take_cache();
         let _unused = tx.send(res);
-        Ok(())
     });
+}
+
+async fn fetch_and_validate_snapshot(
+    dir: &std::path::Path,
+    listener: &Arc<Mutex<OrderBookListener>>,
+    ignore_spot: bool,
+) -> Result<()> {
+    // Start before requesting the snapshot so updates applied while the node writes it
+    // can be replayed both for validation and for replacing a divergent live book.
+    let state = {
+        let mut listener = listener.lock().await;
+        listener.begin_caching();
+        listener.clone_state()
+    };
+    let output_fln = process_rmp_file(dir).await?;
+    let (height, expected_snapshot) = load_snapshots_from_json::<InnerL4Order, (Address, L4Order)>(&output_fln).await?;
+    info!("Snapshot fetched at height {height}");
+    sleep(Duration::from_secs(1)).await;
+
+    if let Some(mut state) = state {
+        let mut cache = listener.lock().await.drain_cache();
+        while state.height() < height {
+            if let Some((order_statuses, order_diffs)) = cache.pop_front() {
+                state.apply_updates(order_statuses, order_diffs)?;
+            } else {
+                error!("Not enough cached updates to validate snapshot {height}; retrying with the next snapshot");
+                return Ok(());
+            }
+        }
+        if state.height() > height {
+            error!("Snapshot {height} lags stored state {}; retrying with the next snapshot", state.height());
+            return Ok(());
+        }
+        validate_or_replace_snapshot(listener, state, expected_snapshot, cache, ignore_spot).await;
+    } else {
+        listener.lock().await.init_from_snapshot(expected_snapshot, height);
+    }
+    Ok(())
+}
+
+async fn validate_or_replace_snapshot(
+    listener: &Arc<Mutex<OrderBookListener>>,
+    state: OrderBookState,
+    expected_snapshot: Snapshots<InnerL4Order>,
+    mut cache: VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)>,
+    ignore_spot: bool,
+) {
+    let stored_snapshot = state.compute_snapshot();
+    let height = stored_snapshot.height;
+    info!("Validating snapshot at height {height}");
+    if let Err(err) = validate_snapshot_consistency(&stored_snapshot.snapshot, &expected_snapshot, ignore_spot) {
+        error!("Snapshot mismatch at height {height}: {err}; discarding the old order book and rebuilding");
+        let mut listener = listener.lock().await;
+        // Validation runs without the lock; include every update that arrived meanwhile.
+        cache.extend(listener.take_cache());
+        listener.replace_from_snapshot(expected_snapshot, height, stored_snapshot.time, cache);
+    }
 }
 
 pub(crate) struct OrderBookListener {
@@ -291,14 +311,11 @@ impl OrderBookListener {
                     cache.push_back((order_statuses.clone(), order_diffs.clone()));
                 }
                 if let Some(tx) = &self.internal_message_tx {
-                    let tx = tx.clone();
-                    tokio::spawn(async move {
-                        let updates = Arc::new(InternalMessage::L4BookUpdates {
-                            diff_batch: order_diffs,
-                            status_batch: order_statuses,
-                        });
-                        let _unused = tx.send(updates);
+                    let updates = Arc::new(InternalMessage::L4BookUpdates {
+                        diff_batch: order_diffs,
+                        status_batch: order_statuses,
                     });
+                    let _unused = tx.send(updates);
                 }
             }
         }
@@ -309,27 +326,64 @@ impl OrderBookListener {
         self.fetched_snapshot_cache = Some(VecDeque::new());
     }
 
-    // tkae the cached updates and stop collecting updates
+    // Drain a prefix while continuing to collect updates during validation.
+    fn drain_cache(&mut self) -> VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)> {
+        self.fetched_snapshot_cache.as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
+    // Take the cached updates and stop collecting updates.
     fn take_cache(&mut self) -> VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)> {
         self.fetched_snapshot_cache.take().unwrap_or_default()
     }
 
     fn init_from_snapshot(&mut self, snapshot: Snapshots<InnerL4Order>, height: u64) {
         info!("No existing snapshot");
-        let mut new_order_book = OrderBookState::from_snapshot(snapshot, height, 0, true, self.ignore_spot);
-        let mut retry = false;
+        self.replace_from_snapshot(snapshot, height, 0, VecDeque::new());
+    }
+
+    fn replace_from_snapshot(
+        &mut self,
+        snapshot: Snapshots<InnerL4Order>,
+        height: u64,
+        time: u64,
+        mut cache: VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)>,
+    ) {
+        let previous_height = self.order_book_state.take().map(|state| state.height());
+        let mut new_order_book = OrderBookState::from_snapshot(snapshot, height, time, true, self.ignore_spot);
+        // Include paired updates not yet applied to the live book; leave unpaired rows
+        // queued until their counterpart arrives.
         while let Some((order_statuses, order_diffs)) = self.pop_cache() {
-            if new_order_book.apply_updates(order_statuses, order_diffs).is_err() {
-                info!(
-                    "Failed to apply updates to this book (likely missing older updates). Waiting for next snapshot."
+            cache.push_back((order_statuses, order_diffs));
+        }
+        for (order_statuses, order_diffs) in cache {
+            if let Err(err) = new_order_book.apply_updates(order_statuses, order_diffs) {
+                error!(
+                    "Failed to replay updates after snapshot {height}: {err}; old order book cleared, waiting for next snapshot"
                 );
-                retry = true;
-                break;
+                return;
             }
         }
-        if !retry {
-            self.order_book_state = Some(new_order_book);
-            info!("Order book ready");
+        if previous_height.is_some_and(|previous| new_order_book.height() < previous) {
+            error!(
+                "Snapshot {height} cannot catch up to {previous_height:?}; old order book cleared, waiting for next snapshot"
+            );
+            return;
+        }
+        self.order_book_state = Some(new_order_book);
+        info!("Order book ready after snapshot {height}");
+        self.send_book_reset();
+    }
+
+    fn send_book_reset(&mut self) {
+        if let Some(tx) = &self.internal_message_tx {
+            if let Some(book) = &mut self.order_book_state {
+                let snapshot = book.compute_snapshot();
+                if let Some((_, l2_snapshots)) = book.l2_snapshots(true) {
+                    // Broadcast synchronously under the listener lock so older updates
+                    // cannot overtake this reset and newer updates always follow it.
+                    let _unused = tx.send(Arc::new(InternalMessage::BookReset { snapshot, l2_snapshots }));
+                }
+            }
         }
     }
 
@@ -434,11 +488,8 @@ impl DirectoryListener for OrderBookListener {
         let snapshot = self.l2_snapshots(true);
         if let Some(snapshot) = snapshot {
             if let Some(tx) = &self.internal_message_tx {
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    let snapshot = Arc::new(InternalMessage::Snapshot { l2_snapshots: snapshot.1, time: snapshot.0 });
-                    let _unused = tx.send(snapshot);
-                });
+                let snapshot = Arc::new(InternalMessage::Snapshot { l2_snapshots: snapshot.1, time: snapshot.0 });
+                let _unused = tx.send(snapshot);
             }
         }
         Ok(())
@@ -462,6 +513,7 @@ pub(crate) struct TimedSnapshots {
 // Messages sent from node data listener to websocket dispatch to support streaming
 pub(crate) enum InternalMessage {
     Snapshot { l2_snapshots: L2Snapshots, time: u64 },
+    BookReset { snapshot: TimedSnapshots, l2_snapshots: L2Snapshots },
     Fills { batch: Batch<NodeDataFill> },
     L4BookUpdates { diff_batch: Batch<NodeDataOrderDiff>, status_batch: Batch<NodeDataOrderStatus> },
 }
@@ -475,6 +527,9 @@ pub(crate) struct L2SnapshotParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::order_book::multi_book::load_snapshots_from_str;
+    use serde::de::DeserializeOwned;
+    use serde_json::{Value, json};
     use std::{fs::OpenOptions, io::Write};
 
     struct TestDirectory(PathBuf);
@@ -553,5 +608,137 @@ mod tests {
             let err = listener.process_data(data, EventSource::OrderStatuses).unwrap_err();
             assert!(err.to_string().contains("deserialization error"));
         }
+    }
+
+    fn order_json(oid: u64) -> Value {
+        json!({
+            "coin": "ETH", "side": "B", "limitPx": "2153.6", "sz": "0.1139",
+            "oid": oid, "timestamp": 1788919049596_u64, "triggerCondition": "N/A",
+            "isTrigger": false, "triggerPx": "0.0", "isPositionTpsl": false,
+            "reduceOnly": false, "orderType": "Limit", "tif": "Gtc", "cloid": null
+        })
+    }
+
+    fn book_snapshot(oids: &[u64]) -> Snapshots<InnerL4Order> {
+        let orders: Vec<_> = oids.iter().map(|&oid| json!([Address::ZERO, order_json(oid)])).collect();
+        let text = json!([100, [["ETH", [orders, []]]]]).to_string();
+        load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(&text).unwrap().1
+    }
+
+    fn batch<E: DeserializeOwned>(height: u64, events: Vec<Value>) -> Batch<E> {
+        serde_json::from_value(json!({
+            "local_time": "2026-09-09T01:57:30", "block_time": "2026-09-09T01:57:29",
+            "block_number": height, "events": events
+        }))
+        .unwrap()
+    }
+
+    fn new_order_batches(height: u64, oid: u64) -> (Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>) {
+        let statuses = batch(
+            height,
+            vec![json!({
+                "time": "2026-09-09T01:57:29", "user": Address::ZERO, "status": "open", "order": order_json(oid)
+            })],
+        );
+        let diffs = batch(
+            height,
+            vec![json!({
+                "user": Address::ZERO, "oid": oid, "coin": "ETH", "px": "2153.6",
+                "raw_book_diff": {"new": {"sz": "0.1139"}}
+            })],
+        );
+        (statuses, diffs)
+    }
+
+    fn receive_new_order(listener: &mut OrderBookListener, height: u64, oid: u64) {
+        let (statuses, diffs) = new_order_batches(height, oid);
+        listener.receive_batch(EventBatch::Orders(statuses)).unwrap();
+        listener.receive_batch(EventBatch::BookDiffs(diffs)).unwrap();
+    }
+
+    fn assert_orders(snapshot: &TimedSnapshots, height: u64, oids: &[u64]) {
+        assert_eq!(snapshot.height, height);
+        let orders = snapshot.snapshot.as_ref()[&Coin::new("ETH")].as_ref();
+        assert_eq!(orders[0].iter().map(|order| order.oid).collect::<Vec<_>>(), oids);
+        assert!(orders[1].is_empty());
+    }
+
+    #[tokio::test]
+    async fn mismatch_replaces_old_orders_and_replays_updates_across_validation() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let mut listener = OrderBookListener::new(Some(tx), true);
+        listener.order_book_state = Some(OrderBookState::from_snapshot(book_snapshot(&[1, 2]), 100, 1, true, true));
+        listener.begin_caching();
+        let state_at_snapshot = listener.clone_state().unwrap();
+        receive_new_order(&mut listener, 101, 3);
+        let cache = listener.drain_cache();
+        // This update arrives after the validation worker has drained its initial cache.
+        receive_new_order(&mut listener, 102, 4);
+        // Preserve an unpaired row until its diff arrives after the reset.
+        let (statuses, diffs) = new_order_batches(103, 5);
+        listener.receive_batch(EventBatch::Orders(statuses)).unwrap();
+        let listener = Arc::new(Mutex::new(listener));
+
+        validate_or_replace_snapshot(&listener, state_at_snapshot, book_snapshot(&[2]), cache, true).await;
+
+        let mut listener = listener.lock().await;
+        assert_orders(&listener.compute_snapshot().unwrap(), 102, &[2, 3, 4]);
+        listener.receive_batch(EventBatch::BookDiffs(diffs)).unwrap();
+        assert_orders(&listener.compute_snapshot().unwrap(), 103, &[2, 3, 4, 5]);
+        for expected_height in [101, 102] {
+            let msg = rx.try_recv().unwrap();
+            assert!(matches!(msg.as_ref(), InternalMessage::L4BookUpdates { diff_batch, .. }
+                if diff_batch.block_number() == expected_height));
+        }
+        let reset = rx.try_recv().unwrap();
+        let InternalMessage::BookReset { snapshot, l2_snapshots } = reset.as_ref() else {
+            panic!("Expected a full snapshot between the old and new updates");
+        };
+        assert_orders(snapshot, 102, &[2, 3, 4]);
+        assert!(l2_snapshots.as_ref().contains_key(&Coin::new("ETH")));
+        let msg = rx.try_recv().unwrap();
+        assert!(matches!(msg.as_ref(), InternalMessage::L4BookUpdates { diff_batch, .. }
+            if diff_batch.block_number() == 103));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn matching_snapshot_leaves_newer_live_orders_intact() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let mut listener = OrderBookListener::new(Some(tx), true);
+        listener.order_book_state = Some(OrderBookState::from_snapshot(book_snapshot(&[1]), 100, 1, true, true));
+        listener.begin_caching();
+        let state_at_snapshot = listener.clone_state().unwrap();
+        receive_new_order(&mut listener, 101, 2);
+        let cache = listener.drain_cache();
+        let listener = Arc::new(Mutex::new(listener));
+
+        validate_or_replace_snapshot(&listener, state_at_snapshot, book_snapshot(&[1]), cache, true).await;
+
+        assert_orders(&listener.lock().await.compute_snapshot().unwrap(), 101, &[1, 2]);
+        assert!(matches!(rx.try_recv().unwrap().as_ref(), InternalMessage::L4BookUpdates { .. }));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn failed_replay_discards_old_book_and_recovers_on_a_later_snapshot() {
+        let mut listener = OrderBookListener::new(None, true);
+        listener.order_book_state = Some(OrderBookState::from_snapshot(book_snapshot(&[1]), 102, 1, true, true));
+        let cache = VecDeque::from([new_order_batches(102, 3)]); // Block 101 is missing.
+        listener.replace_from_snapshot(book_snapshot(&[2]), 100, 1, cache);
+        assert!(!listener.is_ready());
+        assert!(listener.compute_snapshot().is_none());
+
+        receive_new_order(&mut listener, 103, 4);
+        listener.init_from_snapshot(book_snapshot(&[2, 3]), 102);
+        assert_orders(&listener.compute_snapshot().unwrap(), 103, &[2, 3, 4]);
+    }
+
+    #[test]
+    fn replacement_cannot_silently_roll_back_the_live_height() {
+        let mut listener = OrderBookListener::new(None, true);
+        listener.order_book_state = Some(OrderBookState::from_snapshot(book_snapshot(&[1]), 102, 1, true, true));
+        listener.replace_from_snapshot(book_snapshot(&[2]), 100, 1, VecDeque::new());
+        assert!(!listener.is_ready());
     }
 }
