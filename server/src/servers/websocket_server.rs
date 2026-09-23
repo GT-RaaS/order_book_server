@@ -318,7 +318,7 @@ fn coin_to_trades(batch: &Batch<NodeDataFill>, coins: &HashSet<&str>) -> HashMap
     let mut groups: Vec<Vec<NodeDataFill>> = Vec::new();
     // The two sides of a trade need not be adjacent. Preserve first-seen trade order.
     for fill in batch.clone().events() {
-        if fill.1.coin.starts_with('#') || !coins.contains(fill.1.coin.as_str()) {
+        if !coins.contains(fill.1.coin.as_str()) {
             continue;
         }
         let key = (fill.1.coin.clone(), fill.1.tid);
@@ -505,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn trades_only_process_subscribed_non_outcome_coins() {
+    fn trades_only_process_subscribed_coins() {
         let user = Address::ZERO;
         let mut fills = vec![
             fill("#33290", 481212882673789, "A", true, user),
@@ -524,10 +524,10 @@ mod tests {
             fills.push(fill(coin, 1, "A", false, user));
         }
         let batch = fill_batch(fills);
-        let coins = HashSet::from(["BTC", "@123", "PURR/USDC", "#10", "#33290", "#33291", "#44690", "#44691"]);
+        let coins = HashSet::from(["BTC", "@123", "PURR/USDC", "#10"]);
         let trades = coin_to_trades(&batch, &coins);
-        assert_eq!(trades.len(), 3);
-        for coin in ["BTC", "@123", "PURR/USDC"] {
+        assert_eq!(trades.len(), coins.len());
+        for coin in coins {
             assert_eq!(trades[coin].len(), 1);
         }
         assert!(coin_to_trades(&batch, &HashSet::new()).is_empty());
