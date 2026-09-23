@@ -378,7 +378,7 @@ impl OrderBookListener {
         if let Some(tx) = &self.internal_message_tx {
             if let Some(book) = &mut self.order_book_state {
                 let snapshot = book.compute_snapshot();
-                if let Some((_, l2_snapshots)) = book.l2_snapshots(true) {
+                if let Some((_, _, l2_snapshots)) = book.l2_snapshots(true) {
                     // Broadcast synchronously under the listener lock so older updates
                     // cannot overtake this reset and newer updates always follow it.
                     let _unused = tx.send(Arc::new(InternalMessage::BookReset { snapshot, l2_snapshots }));
@@ -393,7 +393,7 @@ impl OrderBookListener {
     }
 
     // prevent snapshotting mutiple times at the same height
-    fn l2_snapshots(&mut self, prevent_future_snaps: bool) -> Option<(u64, L2Snapshots)> {
+    fn l2_snapshots(&mut self, prevent_future_snaps: bool) -> Option<(u64, u64, L2Snapshots)> {
         self.order_book_state.as_mut().and_then(|o| o.l2_snapshots(prevent_future_snaps))
     }
 }
@@ -486,9 +486,9 @@ impl DirectoryListener for OrderBookListener {
             }
         }
         let snapshot = self.l2_snapshots(true);
-        if let Some(snapshot) = snapshot {
+        if let Some((time, height, l2_snapshots)) = snapshot {
             if let Some(tx) = &self.internal_message_tx {
-                let snapshot = Arc::new(InternalMessage::Snapshot { l2_snapshots: snapshot.1, time: snapshot.0 });
+                let snapshot = Arc::new(InternalMessage::Snapshot { l2_snapshots, time, height });
                 let _unused = tx.send(snapshot);
             }
         }
@@ -512,7 +512,7 @@ pub(crate) struct TimedSnapshots {
 
 // Messages sent from node data listener to websocket dispatch to support streaming
 pub(crate) enum InternalMessage {
-    Snapshot { l2_snapshots: L2Snapshots, time: u64 },
+    Snapshot { l2_snapshots: L2Snapshots, time: u64, height: u64 },
     BookReset { snapshot: TimedSnapshots, l2_snapshots: L2Snapshots },
     Fills { batch: Batch<NodeDataFill> },
     L4BookUpdates { diff_batch: Batch<NodeDataOrderDiff>, status_batch: Batch<NodeDataOrderStatus> },

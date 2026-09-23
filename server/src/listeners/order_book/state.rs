@@ -47,13 +47,13 @@ impl OrderBookState {
         TimedSnapshots { time: self.time, height: self.height, snapshot: self.order_book.to_snapshots_par() }
     }
 
-    // (time, snapshot)
-    pub(super) fn l2_snapshots(&mut self, prevent_future_snaps: bool) -> Option<(u64, L2Snapshots)> {
+    // (time, height, snapshot)
+    pub(super) fn l2_snapshots(&mut self, prevent_future_snaps: bool) -> Option<(u64, u64, L2Snapshots)> {
         if self.snapped {
             None
         } else {
             self.snapped = prevent_future_snaps || self.snapped;
-            Some((self.time, compute_l2_snapshots(&self.order_book)))
+            Some((self.time, self.height, compute_l2_snapshots(&self.order_book)))
         }
     }
 

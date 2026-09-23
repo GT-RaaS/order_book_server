@@ -116,10 +116,10 @@ async fn handle_socket(
                 match recv_result {
                     Ok(msg) => {
                         match msg.as_ref() {
-                            InternalMessage::Snapshot{ l2_snapshots, time } => {
+                            InternalMessage::Snapshot{ l2_snapshots, time, height } => {
                                 universe = new_universe(l2_snapshots, ignore_spot);
                                 for sub in manager.subscriptions() {
-                                    send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots.as_ref(), *time).await;
+                                    send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots.as_ref(), *time, *height).await;
                                 }
                             },
                             InternalMessage::BookReset { snapshot, l2_snapshots } => {
@@ -131,11 +131,11 @@ async fn handle_socket(
                                             send_socket_message(&mut socket, msg).await;
                                         }
                                         Subscription::L2Book { coin, .. } if !universe.contains(coin) => {
-                                            let book = L2Book::from_l2_snapshot(coin.clone(), [vec![], vec![]], snapshot.time);
+                                            let book = L2Book::from_l2_snapshot(coin.clone(), [vec![], vec![]], snapshot.time, snapshot.height);
                                             send_socket_message(&mut socket, ServerResponse::L2Book(book)).await;
                                         }
                                         _ => {
-                                            send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots.as_ref(), snapshot.time).await;
+                                            send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots.as_ref(), snapshot.time, snapshot.height).await;
                                         }
                                     }
                                 }
@@ -288,6 +288,7 @@ async fn send_ws_data_from_snapshot(
     subscription: &Subscription,
     snapshot: &HashMap<Coin, HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>,
     time: u64,
+    height: u64,
 ) {
     if let Subscription::L2Book { coin, n_sig_figs, n_levels, mantissa } = subscription {
         let snapshot = snapshot.get(&Coin::new(coin));
@@ -297,7 +298,7 @@ async fn send_ws_data_from_snapshot(
             let n_levels = n_levels.unwrap_or(DEFAULT_LEVELS);
             let snapshot = snapshot.truncate(n_levels);
             let snapshot = snapshot.export_inner_snapshot();
-            let l2_book = L2Book::from_l2_snapshot(coin.clone(), snapshot, time);
+            let l2_book = L2Book::from_l2_snapshot(coin.clone(), snapshot, time, height);
             let msg = ServerResponse::L2Book(l2_book);
             send_socket_message(socket, msg).await;
         } else {

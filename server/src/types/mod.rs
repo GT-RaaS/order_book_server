@@ -41,6 +41,7 @@ impl Level {
 pub(crate) struct L2Book {
     coin: String,
     time: u64,
+    height: u64,
     levels: [Vec<Level>; 2],
 }
 
@@ -51,8 +52,8 @@ pub(crate) enum L4Book {
 }
 
 impl L2Book {
-    pub(crate) const fn from_l2_snapshot(coin: String, snapshot: [Vec<Level>; 2], time: u64) -> Self {
-        Self { coin, time, levels: snapshot }
+    pub(crate) const fn from_l2_snapshot(coin: String, snapshot: [Vec<Level>; 2], time: u64, height: u64) -> Self {
+        Self { coin, time, height, levels: snapshot }
     }
 }
 
