@@ -141,9 +141,11 @@ async fn handle_socket(
                                 }
                             },
                             InternalMessage::Fills{ batch } => {
-                                let mut trades = coin_to_trades(batch);
-                                for sub in manager.subscriptions() {
-                                    send_ws_data_from_trades(&mut socket, sub, &mut trades).await;
+                                if manager.subscriptions().iter().any(|sub| matches!(sub, Subscription::Trades { .. })) {
+                                    let mut trades = coin_to_trades(batch);
+                                    for sub in manager.subscriptions() {
+                                        send_ws_data_from_trades(&mut socket, sub, &mut trades).await;
+                                    }
                                 }
                             },
                             InternalMessage::L4BookUpdates{ diff_batch, status_batch } => {
@@ -308,24 +310,24 @@ async fn send_ws_data_from_snapshot(
 }
 
 fn coin_to_trades(batch: &Batch<NodeDataFill>) -> HashMap<String, Vec<Trade>> {
-    let mut fills = batch.clone().events();
-    let mut trades = HashMap::new();
-    while fills.len() >= 2 {
-        let f2 = fills.pop();
-        let f1 = fills.pop();
-        if let Some(f1) = f1 {
-            if let Some(f2) = f2 {
-                let mut fills = HashMap::new();
-                fills.insert(f1.1.side, f1);
-                fills.insert(f2.1.side, f2);
-                let trade = Trade::from_fills(fills);
-                let coin = trade.coin.clone();
-                trades.entry(coin).or_insert_with(Vec::new).push(trade);
-            }
-        }
+    let mut group_indices = HashMap::new();
+    let mut groups: Vec<Vec<NodeDataFill>> = Vec::new();
+    // The two sides of a trade need not be adjacent. Preserve first-seen trade order.
+    for fill in batch.clone().events() {
+        let key = (fill.1.coin.clone(), fill.1.tid);
+        let index = *group_indices.entry(key).or_insert_with(|| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[index].push(fill);
     }
-    for list in trades.values_mut() {
-        list.reverse();
+    let mut trades = HashMap::new();
+    for fills in groups {
+        if let Some(trade) = Trade::from_fills(&fills) {
+            trades.entry(trade.coin.clone()).or_insert_with(Vec::new).push(trade);
+        } else {
+            error!("Unable to pair trade fills at height {}: {fills:?}", batch.block_number());
+        }
     }
     trades
 }
@@ -410,6 +412,89 @@ mod tests {
     use crate::order_book::multi_book::{Snapshots, load_snapshots_from_str};
     use alloy::primitives::Address;
     use serde_json::json;
+
+    fn fill(coin: &str, tid: u64, side: &str, crossed: bool, user: Address) -> NodeDataFill {
+        serde_json::from_value(json!([user, {
+            "coin": coin, "tid": tid, "side": side, "crossed": crossed,
+            "px": "2000.0", "sz": "1.0", "time": 1788919049596_u64,
+            "startPosition": "0.0", "dir": "Open Long", "closedPnl": "0.0",
+            "hash": "0x123", "oid": tid, "fee": "0.0", "feeToken": "USDC"
+        }]))
+        .unwrap()
+    }
+
+    fn fill_batch(fills: Vec<NodeDataFill>) -> Batch<NodeDataFill> {
+        serde_json::from_value(json!({
+            "local_time": "2026-09-09T01:57:30", "block_time": "2026-09-09T01:57:29",
+            "block_number": 100, "events": fills
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn trades_pair_interleaved_fills_and_preserve_first_seen_order() {
+        let buyer = Address::repeat_byte(1);
+        let seller = Address::repeat_byte(2);
+        let batch = fill_batch(vec![
+            fill("ETH", 1, "B", true, buyer),
+            fill("ETH", 2, "B", false, buyer),
+            fill("ETH", 2, "A", true, seller),
+            fill("ETH", 1, "A", false, seller),
+        ]);
+        let trades = coin_to_trades(&batch);
+        let trades = serde_json::to_value(&trades["ETH"]).unwrap();
+        assert_eq!(
+            trades,
+            json!([
+                {"coin": "ETH", "tid": 1, "side": "B", "px": "2000.0", "sz": "1.0",
+                 "time": 1788919049596_u64, "hash": "0x123", "users": [buyer, seller]},
+                {"coin": "ETH", "tid": 2, "side": "A", "px": "2000.0", "sz": "1.0",
+                 "time": 1788919049596_u64, "hash": "0x123", "users": [buyer, seller]}
+            ])
+        );
+    }
+
+    #[test]
+    fn trades_with_the_same_id_on_different_coins_are_separate() {
+        let buyer = Address::repeat_byte(1);
+        let seller = Address::repeat_byte(2);
+        let batch = fill_batch(vec![
+            fill("ETH", 1, "A", false, seller),
+            fill("BTC", 1, "B", false, buyer),
+            fill("ETH", 1, "B", true, buyer),
+            fill("BTC", 1, "A", true, seller),
+        ]);
+        let trades = coin_to_trades(&batch);
+        assert_eq!(trades.len(), 2);
+        for coin in ["ETH", "BTC"] {
+            assert_eq!(trades[coin].len(), 1);
+            let trade = serde_json::to_value(&trades[coin][0]).unwrap();
+            assert_eq!(trade["coin"], coin);
+            assert_eq!(trade["users"], json!([buyer, seller]));
+        }
+    }
+
+    #[test]
+    fn invalid_fill_groups_do_not_drop_valid_trades_or_panic() {
+        let user = Address::ZERO;
+        let batch = fill_batch(vec![
+            fill("ETH", 1, "A", true, user),
+            fill("ETH", 2, "B", true, user),
+            fill("ETH", 3, "A", true, user),
+            fill("ETH", 3, "A", false, user),
+            fill("ETH", 4, "B", true, user),
+            fill("ETH", 4, "B", false, user),
+            fill("ETH", 5, "A", true, user),
+            fill("ETH", 5, "B", false, user),
+            fill("ETH", 5, "A", true, user),
+            fill("ETH", 6, "A", true, user),
+            fill("ETH", 6, "B", false, user),
+        ]);
+        let trades = coin_to_trades(&batch);
+        assert_eq!(trades["ETH"].len(), 1);
+        assert_eq!(serde_json::to_value(&trades["ETH"][0]).unwrap()["tid"], 6);
+        assert!(coin_to_trades(&fill_batch(vec![])).is_empty());
+    }
 
     #[test]
     fn l4_reset_sends_a_full_snapshot_and_clears_removed_coins() {
