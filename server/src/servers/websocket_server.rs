@@ -141,8 +141,12 @@ async fn handle_socket(
                                 }
                             },
                             InternalMessage::Fills{ batch } => {
-                                if manager.subscriptions().iter().any(|sub| matches!(sub, Subscription::Trades { .. })) {
-                                    let mut trades = coin_to_trades(batch);
+                                let coins = manager.subscriptions().iter().filter_map(|sub| match sub {
+                                    Subscription::Trades { coin } => Some(coin.as_str()),
+                                    _ => None,
+                                }).collect::<HashSet<_>>();
+                                if !coins.is_empty() {
+                                    let mut trades = coin_to_trades(batch, &coins);
                                     for sub in manager.subscriptions() {
                                         send_ws_data_from_trades(&mut socket, sub, &mut trades, batch.block_number()).await;
                                     }
@@ -309,11 +313,14 @@ async fn send_ws_data_from_snapshot(
     }
 }
 
-fn coin_to_trades(batch: &Batch<NodeDataFill>) -> HashMap<String, Vec<Trade>> {
+fn coin_to_trades(batch: &Batch<NodeDataFill>, coins: &HashSet<&str>) -> HashMap<String, Vec<Trade>> {
     let mut group_indices = HashMap::new();
     let mut groups: Vec<Vec<NodeDataFill>> = Vec::new();
     // The two sides of a trade need not be adjacent. Preserve first-seen trade order.
     for fill in batch.clone().events() {
+        if fill.1.coin.starts_with('#') || !coins.contains(fill.1.coin.as_str()) {
+            continue;
+        }
         let key = (fill.1.coin.clone(), fill.1.tid);
         let index = *group_indices.entry(key).or_insert_with(|| {
             groups.push(Vec::new());
@@ -442,7 +449,7 @@ mod tests {
             fill("ETH", 2, "A", true, seller),
             fill("ETH", 1, "A", false, seller),
         ]);
-        let trades = coin_to_trades(&batch);
+        let trades = coin_to_trades(&batch, &HashSet::from(["ETH"]));
         let trades = serde_json::to_value(&trades["ETH"]).unwrap();
         assert_eq!(
             trades,
@@ -465,7 +472,7 @@ mod tests {
             fill("ETH", 1, "B", true, buyer),
             fill("BTC", 1, "A", true, seller),
         ]);
-        let trades = coin_to_trades(&batch);
+        let trades = coin_to_trades(&batch, &HashSet::from(["ETH", "BTC"]));
         assert_eq!(trades.len(), 2);
         for coin in ["ETH", "BTC"] {
             assert_eq!(trades[coin].len(), 1);
@@ -491,10 +498,39 @@ mod tests {
             fill("ETH", 6, "A", true, user),
             fill("ETH", 6, "B", false, user),
         ]);
-        let trades = coin_to_trades(&batch);
+        let trades = coin_to_trades(&batch, &HashSet::from(["ETH"]));
         assert_eq!(trades["ETH"].len(), 1);
         assert_eq!(serde_json::to_value(&trades["ETH"][0]).unwrap()["tid"], 6);
-        assert!(coin_to_trades(&fill_batch(vec![])).is_empty());
+        assert!(coin_to_trades(&fill_batch(vec![]), &HashSet::from(["ETH"])).is_empty());
+    }
+
+    #[test]
+    fn trades_only_process_subscribed_non_outcome_coins() {
+        let user = Address::ZERO;
+        let mut fills = vec![
+            fill("#33290", 481212882673789, "A", true, user),
+            fill("#33291", 583392906092948, "A", true, user),
+            fill("#44690", 532792333879334, "A", true, user),
+            fill("#44691", 771181182710302, "A", false, user),
+        ];
+        for fill in &mut fills[..2] {
+            fill.1.dir = "Merge Outcome".to_string();
+        }
+        for fill in &mut fills[2..] {
+            fill.1.dir = "Sell".to_string();
+        }
+        for coin in ["BTC", "ETH", "@123", "PURR/USDC", "#10"] {
+            fills.push(fill(coin, 1, "B", true, user));
+            fills.push(fill(coin, 1, "A", false, user));
+        }
+        let batch = fill_batch(fills);
+        let coins = HashSet::from(["BTC", "@123", "PURR/USDC", "#10", "#33290", "#33291", "#44690", "#44691"]);
+        let trades = coin_to_trades(&batch, &coins);
+        assert_eq!(trades.len(), 3);
+        for coin in ["BTC", "@123", "PURR/USDC"] {
+            assert_eq!(trades[coin].len(), 1);
+        }
+        assert!(coin_to_trades(&batch, &HashSet::new()).is_empty());
     }
 
     #[test]
