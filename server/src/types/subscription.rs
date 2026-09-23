@@ -80,7 +80,7 @@ pub(crate) enum ServerResponse {
     SubscriptionResponse(ClientMessage),
     L2Book(L2Book),
     L4Book(L4Book),
-    Trades(Vec<Trade>),
+    Trades { block_number: u64, fills: Vec<Trade> },
     Error(String),
 }
 
@@ -131,10 +131,11 @@ mod test {
     #[test]
     fn test_message_deserialization_trade() {
         let message = r#"
-            {"channel":"trades","data":[{"coin":"BTC","side":"A","px":"106296.0","sz":"0.00017","time":1751430933565,"hash":"0xde93a8a0729ade63d8840417805ba9010b008818422ddedb1285744426b73503","tid":293353986402527,"users":["0xcc0a3b6e3267c84361e91d8230868eea53431e4b","0xc64cc00b46101bd40aa1c3121195e85c0b0918d8"]}]}
+            {"channel":"trades","data":{"block_number":100,"fills":[{"coin":"BTC","side":"A","px":"106296.0","sz":"0.00017","time":1751430933565,"hash":"0xde93a8a0729ade63d8840417805ba9010b008818422ddedb1285744426b73503","tid":293353986402527,"users":["0xcc0a3b6e3267c84361e91d8230868eea53431e4b","0xc64cc00b46101bd40aa1c3121195e85c0b0918d8"]}]}}
         "#;
         let msg: ServerResponse = serde_json::from_str(message).unwrap();
-        assert!(matches!(msg, ServerResponse::Trades(_)));
+        assert!(matches!(msg, ServerResponse::Trades { block_number: 100, .. }));
+        assert_eq!(serde_json::to_value(msg).unwrap(), serde_json::from_str::<serde_json::Value>(message).unwrap());
     }
 
     #[test]

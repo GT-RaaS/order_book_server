@@ -144,7 +144,7 @@ async fn handle_socket(
                                 if manager.subscriptions().iter().any(|sub| matches!(sub, Subscription::Trades { .. })) {
                                     let mut trades = coin_to_trades(batch);
                                     for sub in manager.subscriptions() {
-                                        send_ws_data_from_trades(&mut socket, sub, &mut trades).await;
+                                        send_ws_data_from_trades(&mut socket, sub, &mut trades, batch.block_number()).await;
                                     }
                                 }
                             },
@@ -369,10 +369,11 @@ async fn send_ws_data_from_trades(
     socket: &mut WebSocket,
     subscription: &Subscription,
     trades: &mut HashMap<String, Vec<Trade>>,
+    block_number: u64,
 ) {
     if let Subscription::Trades { coin } = subscription {
         if let Some(trades) = trades.remove(coin) {
-            let msg = ServerResponse::Trades(trades);
+            let msg = ServerResponse::Trades { block_number, fills: trades };
             send_socket_message(socket, msg).await;
         }
     }

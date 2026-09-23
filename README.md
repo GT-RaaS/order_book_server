@@ -11,6 +11,7 @@ This server provides the `l2book` and `trades` endpoints from [Hyperliquid’s o
 - The `l2book` subscription now includes an optional field:
   `n_levels`, which can be up to `100` and defaults to `20`.
 - Each `l2Book` response includes `height`, the block height represented by the snapshot, alongside `coin`, `time`, and `levels`. This also applies to snapshots sent after recovery, including empty snapshots.
+- Each `trades` response uses a `data` object containing `block_number` (the block number of the source `node_fills_by_block` batch) and a `fills` array with the existing trade item format. The subscription type and response channel remain `trades`.
 - This server also introduces a new endpoint: `l4book`.
 
 The `l4book` subscription first sends a snapshot of the entire book and then forwards order diffs by block. A new full snapshot is also sent after the server rebuilds its order book. Clients must replace their local book whenever they receive an `L4Book::Snapshot`, including clearing it when both sides are empty, and then apply subsequent updates. The subscription format is:
