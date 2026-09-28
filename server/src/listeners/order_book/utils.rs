@@ -84,11 +84,30 @@ pub(super) fn validate_snapshot_consistency<O: InnerOrder + PartialEq + Debug>(
                 }
             }
         } else if !book1[0].is_empty() || !book1[1].is_empty() {
-            return Err(format!("Missing {} book", coin.value()).into());
+            return Err(format!(
+                "Missing {} book in node snapshot, local_bid_count: {}, local_ask_count: {}",
+                coin.value(),
+                book1[0].len(),
+                book1[1].len(),
+            )
+            .into());
         }
     }
     if !snapshot_map.is_empty() {
-        return Err("Extra orderbooks detected".to_string().into());
+        let mut books: Vec<_> = snapshot_map
+            .into_iter()
+            .map(|(coin, book)| {
+                let [bids, asks] = book.as_ref();
+                format!("{{coin: {}, bid_count: {}, ask_count: {}}}", coin.value(), bids.len(), asks.len())
+            })
+            .collect();
+        books.sort();
+        return Err(format!(
+            "Extra orderbooks detected in node snapshot, book_count: {}, books: [{}]",
+            books.len(),
+            books.join(", "),
+        )
+        .into());
     }
     Ok(())
 }
