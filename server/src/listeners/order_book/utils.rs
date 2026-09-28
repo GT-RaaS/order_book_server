@@ -93,6 +93,11 @@ pub(super) fn validate_snapshot_consistency<O: InnerOrder + PartialEq + Debug>(
             .into());
         }
     }
+    // Node-only empty books do not represent missing orders.
+    snapshot_map.retain(|_, book| {
+        let [bids, asks] = book.as_ref();
+        !bids.is_empty() || !asks.is_empty()
+    });
     if !snapshot_map.is_empty() {
         let mut books: Vec<_> = snapshot_map
             .into_iter()
@@ -240,6 +245,42 @@ mod tests {
     fn matching_snapshots_pass() {
         let orders = vec![order(1, Side::Bid), order(2, Side::Bid)];
         assert!(validate_snapshot_consistency(&snapshot(orders.clone()), &snapshot(orders), false).is_ok());
+    }
+
+    #[test]
+    fn extra_empty_orderbooks_do_not_trigger_mismatch() {
+        let received = snapshot(vec![order(1, Side::Bid)]);
+        let mut expected = snapshot(vec![order(1, Side::Bid)]).value();
+        for coin in ["#63630", "#63631"] {
+            expected.insert(Coin::new(coin), OrderBook::new().to_snapshot());
+        }
+        let expected = Snapshots::new(expected);
+        for ignore_spot in [false, true] {
+            assert!(validate_snapshot_consistency(&received, &expected, ignore_spot).is_ok());
+            assert!(validate_snapshot_consistency(&expected, &received, ignore_spot).is_ok());
+        }
+    }
+
+    #[test]
+    fn extra_nonempty_orderbooks_still_trigger_mismatch() {
+        for (side, bid_count, ask_count) in [(Side::Bid, 1, 0), (Side::Ask, 0, 1)] {
+            let received = snapshot(vec![]);
+            let mut expected = snapshot(vec![]).value();
+            expected.insert(Coin::new("#63631"), OrderBook::new().to_snapshot());
+            let mut extra_order = order(1, side);
+            extra_order.coin = Coin::new("#63630");
+            let mut extra_book = OrderBook::new();
+            extra_book.add_order(extra_order);
+            expected.insert(Coin::new("#63630"), extra_book.to_snapshot());
+            let error =
+                validate_snapshot_consistency(&received, &Snapshots::new(expected), true).unwrap_err().to_string();
+            assert_eq!(
+                error,
+                format!(
+                    "Extra orderbooks detected in node snapshot, book_count: 1, books: [{{coin: #63630, bid_count: {bid_count}, ask_count: {ask_count}}}]"
+                )
+            );
+        }
     }
 
     #[test]
