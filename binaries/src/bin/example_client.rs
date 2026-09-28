@@ -12,6 +12,7 @@ enum Subscription {
     L2Book,
     L4Book,
     Trades,
+    Fills,
 }
 
 #[derive(Debug, Parser)]
@@ -25,7 +26,7 @@ struct Args {
     #[arg(long)]
     port: u16,
 
-    /// Subscription type: l2-book, l4-book, trades
+    /// Subscription type: l2-book, l4-book, trades, fills
     #[arg(long, value_enum, default_value_t = Subscription::L2Book)]
     subscription: Subscription,
 }
@@ -50,12 +51,14 @@ async fn main() -> Result<()> {
         r#"{"method":"subscribe","subscription":{"type":"l2Book","coin":"BTC","nSigFigs":5,"mantissa":5}}"#;
     let l4_book_sub = r#"{"method":"subscribe","subscription":{"type":"l4Book","coin":"BTC"}}"#;
     let trades_sub = r#"{"method":"subscribe","subscription":{"type":"trades","coin":"BTC"}}"#;
+    let fills_sub = r#"{"method":"subscribe","subscription":{"type":"fills","coin":"BTC"}}"#;
 
     // Choose subscription
     match args.subscription {
         Subscription::L2Book => write.send(Message::Text(l2_book_sub.into())).await?,
         Subscription::L4Book => write.send(Message::Text(l4_book_sub.into())).await?,
         Subscription::Trades => write.send(Message::Text(trades_sub.into())).await?,
+        Subscription::Fills => write.send(Message::Text(fills_sub.into())).await?,
     }
 
     let mut msg_cnt = 0;

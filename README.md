@@ -26,6 +26,53 @@ The `l4book` subscription first sends a snapshot of the entire book and then for
 }
 ```
 
+The `fills` subscription sends the selected coin's `NodeDataFill` events from each
+`node_fills_by_block` batch. It preserves event order and sends individual fills
+without pairing them into trades. Each item is `[user_address, Fill]`, including
+fields such as `oid`, `fee`, and `liquidation` (`null` when absent).
+There is no initial snapshot, and batches without fills for the coin produce no message.
+Coin validation follows the same rules as `trades`.
+
+```json
+{"method":"subscribe","subscription":{"type":"fills","coin":"ETH"}}
+```
+
+Example response:
+
+```json
+{
+  "channel": "fills",
+  "data": {
+    "block_number": 1163101327,
+    "fills": [
+      [
+        "0x5bd129ad758a42070fdb4384c6cf064238a6440f",
+        {
+          "coin": "ETH",
+          "px": "2153.6",
+          "sz": "1.5",
+          "side": "B",
+          "time": 1790520990000,
+          "startPosition": "0.0",
+          "dir": "Open Long",
+          "closedPnl": "0.0",
+          "hash": "0x55ef854b7caad38957690445075e83020463003117adf25bf9b8309e3baead73",
+          "oid": 558017335212,
+          "crossed": true,
+          "fee": "0.5",
+          "tid": 481212882673789,
+          "feeToken": "USDC",
+          "liquidation": null
+        }
+      ]
+    ]
+  }
+}
+```
+
+Use `"method":"unsubscribe"` with the same subscription to stop receiving fills.
+The example client supports `--subscription fills` (subscribes to BTC).
+
 ## Setup
 
 1. Run a non-validating node (from [`hyperliquid-dex/node`](https://github.com/hyperliquid-dex/node)). Requires batching by block. Requires recording fills, order statuses, and raw book diffs. Requires handling info requests. 

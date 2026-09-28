@@ -141,6 +141,16 @@ async fn handle_socket(
                                 }
                             },
                             InternalMessage::Fills{ batch } => {
+                                let fill_coins = manager.subscriptions().iter().filter_map(|sub| match sub {
+                                    Subscription::Fills { coin } => Some(coin.as_str()),
+                                    _ => None,
+                                }).collect::<HashSet<_>>();
+                                if !fill_coins.is_empty() {
+                                    for (_, fills) in coin_to_fills(batch, &fill_coins) {
+                                        let msg = ServerResponse::Fills { block_number: batch.block_number(), fills };
+                                        send_socket_message(&mut socket, msg).await;
+                                    }
+                                }
                                 let coins = manager.subscriptions().iter().filter_map(|sub| match sub {
                                     Subscription::Trades { coin } => Some(coin.as_str()),
                                     _ => None,
@@ -313,6 +323,16 @@ async fn send_ws_data_from_snapshot(
     }
 }
 
+fn coin_to_fills(batch: &Batch<NodeDataFill>, coins: &HashSet<&str>) -> HashMap<String, Vec<NodeDataFill>> {
+    let mut fills = HashMap::new();
+    for fill in batch.clone().events() {
+        if coins.contains(fill.1.coin.as_str()) {
+            fills.entry(fill.1.coin.clone()).or_insert_with(Vec::new).push(fill);
+        }
+    }
+    fills
+}
+
 fn coin_to_trades(batch: &Batch<NodeDataFill>, coins: &HashSet<&str>) -> HashMap<String, Vec<Trade>> {
     let mut group_indices = HashMap::new();
     let mut groups: Vec<Vec<NodeDataFill>> = Vec::new();
@@ -437,6 +457,43 @@ mod tests {
             "block_number": 100, "events": fills
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn fills_preserve_raw_events_and_block_number_for_subscribed_coins() {
+        let buyer = Address::repeat_byte(1);
+        let seller = Address::repeat_byte(2);
+        let mut liquidation = fill("ETH", 2, "A", true, seller);
+        liquidation.1.liquidation = Some(
+            serde_json::from_value(json!({
+                "liquidatedUser": seller.to_string(), "markPx": "2001.5", "method": "market"
+            }))
+            .unwrap(),
+        );
+        let events = vec![
+            fill("ETH", 1, "B", true, buyer),
+            fill("BTC", 1, "A", false, seller),
+            liquidation,
+            fill("ETH", 1, "A", false, seller),
+            fill("#33290", 3, "A", true, seller),
+        ];
+        let batch = fill_batch(events.clone());
+        let mut by_coin = coin_to_fills(&batch, &HashSet::from(["ETH", "#33290", "SOL"]));
+        assert_eq!(by_coin.len(), 2);
+        assert_eq!(serde_json::to_value(&by_coin["#33290"]).unwrap(), json!([events[4]]));
+
+        let response =
+            ServerResponse::Fills { block_number: batch.block_number(), fills: by_coin.remove("ETH").unwrap() };
+        let expected = json!({
+            "channel": "fills",
+            "data": {"block_number": 100, "fills": [events[0], events[2], events[3]]}
+        });
+        assert_eq!(serde_json::to_value(response).unwrap(), expected);
+        let response: ServerResponse = serde_json::from_value(expected.clone()).unwrap();
+        assert_eq!(serde_json::to_value(response).unwrap(), expected);
+        assert!(coin_to_fills(&batch, &HashSet::new()).is_empty());
+        assert!(coin_to_fills(&fill_batch(vec![]), &HashSet::from(["ETH"])).is_empty());
+        assert_eq!(coin_to_trades(&batch, &HashSet::from(["ETH"]))["ETH"].len(), 1);
     }
 
     #[test]

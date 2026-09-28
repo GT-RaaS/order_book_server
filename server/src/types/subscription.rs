@@ -1,4 +1,4 @@
-use crate::types::{L2Book, L4Book, Trade};
+use crate::types::{L2Book, L4Book, Trade, node_data::NodeDataFill};
 use log::info;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -21,6 +21,8 @@ pub(crate) enum Subscription {
     #[serde(rename_all = "camelCase")]
     Trades { coin: String },
     #[serde(rename_all = "camelCase")]
+    Fills { coin: String },
+    #[serde(rename_all = "camelCase")]
     L2Book { coin: String, n_sig_figs: Option<u32>, n_levels: Option<usize>, mantissa: Option<u64> },
     #[serde(rename_all = "camelCase")]
     L4Book { coin: String },
@@ -29,7 +31,7 @@ pub(crate) enum Subscription {
 impl Subscription {
     pub(crate) fn validate(&self, universe: &HashSet<String>) -> bool {
         match self {
-            Self::Trades { coin } => universe.contains(coin),
+            Self::Trades { coin } | Self::Fills { coin } => universe.contains(coin),
             Self::L2Book { coin, n_sig_figs, n_levels, mantissa } => {
                 if !universe.contains(coin) || coin.starts_with('@') {
                     info!("Invalid subscription: coin not found");
@@ -81,6 +83,7 @@ pub(crate) enum ServerResponse {
     L2Book(L2Book),
     L4Book(L4Book),
     Trades { block_number: u64, fills: Vec<Trade> },
+    Fills { block_number: u64, fills: Vec<NodeDataFill> },
     Error(String),
 }
 
@@ -150,5 +153,21 @@ mod test {
                 subscription: Subscription::L2Book { n_sig_figs: None, n_levels: None, mantissa: None, .. },
             }
         ));
+    }
+
+    #[test]
+    fn fills_subscription_requests() {
+        let universe = std::collections::HashSet::from(["ETH".to_string()]);
+        for method in ["subscribe", "unsubscribe"] {
+            let request = serde_json::json!({"method": method, "subscription": {"type": "fills", "coin": "ETH"}});
+            let message: ClientMessage = serde_json::from_value(request.clone()).unwrap();
+            let subscription = match &message {
+                ClientMessage::Subscribe { subscription } | ClientMessage::Unsubscribe { subscription } => subscription,
+            };
+            assert_eq!(subscription, &Subscription::Fills { coin: "ETH".to_string() });
+            assert!(subscription.validate(&universe));
+            assert!(!subscription.validate(&std::collections::HashSet::new()));
+            assert_eq!(serde_json::to_value(message).unwrap(), request);
+        }
     }
 }

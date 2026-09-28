@@ -290,13 +290,9 @@ impl OrderBookListener {
             }
             EventBatch::Fills(batch) => {
                 if self.last_fill.is_none_or(|height| height < batch.block_number()) {
-                    // send fill updates if we received a new update
+                    self.last_fill = Some(batch.block_number());
                     if let Some(tx) = &self.internal_message_tx {
-                        let tx = tx.clone();
-                        tokio::spawn(async move {
-                            let snapshot = Arc::new(InternalMessage::Fills { batch });
-                            let _unused = tx.send(snapshot);
-                        });
+                        let _unused = tx.send(Arc::new(InternalMessage::Fills { batch }));
                     }
                 }
             }
@@ -631,6 +627,37 @@ mod tests {
             "block_number": height, "events": events
         }))
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn fill_batches_skip_duplicate_and_older_blocks() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let mut listener = OrderBookListener::new(Some(tx), true);
+        for height in [100, 100, 99, 101, 103, 102, 103] {
+            listener.receive_batch(EventBatch::Fills(batch(height, vec![]))).unwrap();
+            tokio::task::yield_now().await;
+        }
+        for height in [100, 101, 103] {
+            let message = rx.try_recv().unwrap();
+            let InternalMessage::Fills { batch } = message.as_ref() else {
+                panic!("Expected fills");
+            };
+            assert_eq!(batch.block_number(), height);
+        }
+        assert!(matches!(rx.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn fill_batches_are_broadcast_before_returning() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let mut listener = OrderBookListener::new(Some(tx), true);
+        for height in 100..103 {
+            listener.receive_batch(EventBatch::Fills(batch(height, vec![]))).unwrap();
+        }
+        for height in 100..103 {
+            let message = rx.try_recv().unwrap();
+            assert!(matches!(message.as_ref(), InternalMessage::Fills { batch } if batch.block_number() == height));
+        }
     }
 
     fn new_order_batches(height: u64, oid: u64) -> (Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>) {
