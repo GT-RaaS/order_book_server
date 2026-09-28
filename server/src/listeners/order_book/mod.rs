@@ -663,6 +663,78 @@ mod tests {
         assert!(orders[1].is_empty());
     }
 
+    #[test]
+    fn new_orders_use_book_diff_price_and_size() {
+        for (side, side_index, triggered) in [("A", 1, true), ("B", 0, true), ("A", 1, false), ("B", 0, false)] {
+            let mut existing = order_json(1);
+            existing["coin"] = json!("xyz:QNT");
+            existing["side"] = json!(side);
+            existing["limitPx"] = json!("148.06");
+            existing["sz"] = json!("2");
+            let snapshot = |orders: Vec<Value>| {
+                let mut sides = [vec![], vec![]];
+                sides[side_index] = orders.into_iter().map(|order| json!([Address::ZERO, order])).collect();
+                load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(
+                    &json!([100, [["xyz:QNT", sides]]]).to_string(),
+                )
+                .unwrap()
+                .1
+            };
+            let mut state = OrderBookState::from_snapshot(snapshot(vec![existing.clone()]), 100, 1, true, true);
+            let mut incoming = existing.clone();
+            incoming["oid"] = json!(2);
+            incoming["limitPx"] = json!("148.05");
+            incoming["sz"] = json!("9");
+            incoming["reduceOnly"] = json!(true);
+            if triggered {
+                incoming["isTrigger"] = json!(true);
+                incoming["triggerPx"] = json!("150.0");
+                incoming["triggerCondition"] = json!("Price below 150.0");
+                incoming["orderType"] = json!("Stop Market");
+                incoming["tif"] = Value::Null;
+            }
+            let statuses: Batch<NodeDataOrderStatus> = batch(
+                101,
+                vec![json!({
+                    "time": "2026-09-09T01:57:29", "user": Address::ZERO,
+                    "status": if triggered { "triggered" } else { "open" }, "order": incoming
+                })],
+            );
+            let entered_at = statuses.block_time();
+            let diffs = batch(
+                101,
+                vec![json!({
+                    "user": Address::ZERO, "oid": 2, "coin": "xyz:QNT", "px": "148.06",
+                    "raw_book_diff": {"new": {"sz": "3"}}
+                })],
+            );
+            state.apply_updates(statuses, diffs).unwrap();
+
+            let actual = state.compute_snapshot();
+            let orders = &actual.snapshot.as_ref()[&Coin::new("xyz:QNT")].as_ref()[side_index];
+            let new_order = orders.iter().find(|order| order.oid == 2).unwrap();
+            assert_eq!(new_order.limit_px.to_str(), "148.06", "side={side}, triggered={triggered}");
+            assert_eq!(new_order.sz.to_str(), "3");
+            assert_eq!(orders.iter().map(|order| order.oid).collect::<Vec<_>>(), [1, 2]);
+
+            incoming["limitPx"] = json!("148.06");
+            incoming["sz"] = json!("3");
+            if triggered {
+                incoming["isTrigger"] = json!(false);
+                incoming["triggerPx"] = json!("0.0");
+                incoming["triggerCondition"] = json!("Triggered");
+                incoming["timestamp"] = json!(entered_at);
+                incoming["tif"] = json!("Gtc");
+            }
+            validate_snapshot_consistency(&actual.snapshot, &snapshot(vec![existing, incoming]), true).unwrap();
+
+            let (_, _, l2) = state.l2_snapshots(false).unwrap();
+            let levels = &l2.as_ref()[&Coin::new("xyz:QNT")][&L2SnapshotParams::new(None, None)].as_ref()[side_index];
+            assert_eq!(levels.len(), 1);
+            assert_eq!((levels[0].px.to_str(), levels[0].sz.to_str(), levels[0].n), ("148.06".into(), "5".into(), 2));
+        }
+    }
+
     #[tokio::test]
     async fn mismatch_replaces_old_orders_and_replays_updates_across_validation() {
         let (tx, mut rx) = tokio::sync::broadcast::channel(16);

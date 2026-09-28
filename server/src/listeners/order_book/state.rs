@@ -1,7 +1,7 @@
 use crate::{
     listeners::order_book::{L2Snapshots, TimedSnapshots, utils::compute_l2_snapshots},
     order_book::{
-        Coin, InnerOrder, Oid,
+        Coin, InnerOrder, Oid, Px,
         multi_book::{OrderBooks, Snapshots},
     },
     prelude::*,
@@ -99,6 +99,8 @@ impl OrderBookState {
                     if let Some(order) = order_map.remove(&oid) {
                         let time = order.time.and_utc().timestamp_millis();
                         let mut inner_order: InnerL4Order = order.try_into()?;
+                        // The book diff contains the actual resting price, including for triggered orders.
+                        inner_order.limit_px = Px::parse_from_str(diff.px())?;
                         inner_order.modify_sz(sz);
                         // must replace time with time of entering book, which is the timestamp of the order status update
                         #[allow(clippy::unwrap_used)]
