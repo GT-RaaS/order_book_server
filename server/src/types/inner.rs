@@ -23,7 +23,6 @@ pub(crate) struct InnerL4Order {
     pub trigger_condition: String,
     pub is_trigger: bool,
     pub trigger_px: String,
-    pub children: Vec<Self>,
     pub is_position_tpsl: bool,
     pub reduce_only: bool,
     pub order_type: String,
@@ -93,7 +92,6 @@ impl TryFrom<(Address, L4Order)> for InnerL4Order {
             is_trigger,
             trigger_px,
             is_position_tpsl,
-            children,
             reduce_only,
             order_type,
             tif,
@@ -103,7 +101,6 @@ impl TryFrom<(Address, L4Order)> for InnerL4Order {
         let user = value.0;
         let limit_px = Px::parse_from_str(&limit_px)?;
         let sz = Sz::parse_from_str(&sz)?;
-        let children = children.into_iter().map(|o| Self::try_from((user, o))).collect::<Result<Vec<_>>>()?;
         Ok(Self {
             user,
             coin: Coin::new(&coin),
@@ -115,7 +112,6 @@ impl TryFrom<(Address, L4Order)> for InnerL4Order {
             trigger_condition,
             is_trigger,
             trigger_px,
-            children,
             is_position_tpsl,
             reduce_only,
             order_type,
@@ -139,7 +135,6 @@ impl From<InnerL4Order> for L4Order {
             is_trigger,
             trigger_px,
             is_position_tpsl,
-            children,
             reduce_only,
             order_type,
             tif,
@@ -159,7 +154,6 @@ impl From<InnerL4Order> for L4Order {
             is_trigger,
             trigger_px,
             is_position_tpsl,
-            children: children.into_iter().map(|o| o.into()).collect(),
             reduce_only,
             order_type,
             tif,

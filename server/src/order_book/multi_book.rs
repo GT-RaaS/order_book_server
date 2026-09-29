@@ -182,7 +182,6 @@ mod tests {
             trigger_condition: String::new(),
             is_trigger: false,
             trigger_px: String::new(),
-            children: vec![],
             is_position_tpsl: false,
             reduce_only: false,
             order_type: String::new(),
