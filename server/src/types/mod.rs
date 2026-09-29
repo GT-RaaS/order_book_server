@@ -109,6 +109,7 @@ pub(crate) struct L4Order {
     pub trigger_condition: String,
     pub is_trigger: bool,
     pub trigger_px: String,
+    pub children: Vec<L4Order>,
     pub is_position_tpsl: bool,
     pub reduce_only: bool,
     pub order_type: String,

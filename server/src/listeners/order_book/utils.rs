@@ -225,6 +225,7 @@ mod tests {
             trigger_condition: "N/A".into(),
             is_trigger: false,
             trigger_px: "0.0".into(),
+            children: vec![],
             is_position_tpsl: false,
             reduce_only: false,
             order_type: "Limit".into(),
